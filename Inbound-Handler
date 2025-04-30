@@ -500,7 +500,7 @@ async function monitorUltravoxCall(callId) {
                         console.log(`[${callId}] Recording API response:`, recordingResponse.status);
                         
                         if (recordingResponse.ok) {
-                            const recordingsDir = '/var/www/vhosts/smartfollowup.ai/httpdocs/recordings';
+                            const recordingsDir = '/var/www/vhosts/example.com/httpdocs/recordings';
                             if (!fs.existsSync(recordingsDir)) {
                                 fs.mkdirSync(recordingsDir, { recursive: true });
                             }
@@ -1338,7 +1338,7 @@ async function handleCallCompletion(callId, ultravoxId) {
                 });
                 
                 if (recordingResponse.ok) {
-                    const recordingsDir = '/var/www/vhosts/smartfollowup.ai/httpdocs/recordings';
+                    const recordingsDir = '/var/www/vhosts/example.com/httpdocs/recordings';
                     if (!fs.existsSync(recordingsDir)) {
                         fs.mkdirSync(recordingsDir, { recursive: true });
                     }
