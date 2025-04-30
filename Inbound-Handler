@@ -300,9 +300,9 @@ fastify.register(fastifyWebsocket, {
 // Database connection config
 const dbConfig = {
     host: 'localhost',
-    user: 'voice',
-    password: 'Silverbook224!',
-    database: 'voice',
+    user: 'user',
+    password: 'password',
+    database: 'db_name',
     connectTimeout: 30000,
     connectionLimit: 25,      // Increased for more concurrent connections
     acquireTimeout: 30000,    // Time to wait for a connection from pool
