@@ -1,0 +1,1406 @@
+#!/usr/bin/env node
+
+import Fastify from 'fastify';
+import fastifyFormBody from '@fastify/formbody';
+import twilio from 'twilio';
+import { config } from 'dotenv';
+import * as mariadb from 'mariadb';
+import fetch from 'node-fetch';
+import { v4 as uuidv4 } from 'uuid';
+import fs from 'fs';
+import { setTimeout } from 'timers/promises';
+import fastifyWebsocket from '@fastify/websocket';
+import WebSocket from 'ws';
+
+// Utility function to format phone numbers consistently
+function formatPhoneNumber(phoneNumber) {
+    if (!phoneNumber) return null;
+    
+    // Remove all non-digit characters
+    let digits = phoneNumber.replace(/[^0-9]/g, '');
+    
+    // Handle different formats
+    if (digits.length === 10) {
+        // Add +1 prefix for 10-digit numbers
+        return `+1${digits}`;
+    } else if (digits.length === 11 && digits.startsWith('1')) {
+        // Add + prefix for 11-digit numbers starting with 1
+        return `+${digits}`;
+    } else if (digits.length === 11) {
+        // Handle other 11-digit numbers
+        return `+${digits}`;
+    }
+    
+    // Return null for invalid numbers
+    return null;
+}
+
+// Load environment variables
+config();
+
+// Initialize fastify with base path
+const fastify = Fastify({ 
+    logger: true,
+    ignoreTrailingSlash: true
+});
+
+// Get the base URL from environment
+const BASE_URL = process.env.BASE_URL;
+
+// Initialize Twilio client
+const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+// Configure Twilio webhook URLs
+const WEBHOOK_URLS = {
+    incoming: `${BASE_URL}/inbound-handler/incoming`,
+    status: `${BASE_URL}/inbound-handler/status`,
+    stream: `${BASE_URL}/inbound-handler/stream`
+};
+
+// Define the incoming call handler
+async function handleIncomingCall(request, reply) {
+    console.log('📞 Raw Twilio Request Body:', request.body);
+    
+    const callId = request.body.CallSid || 
+                  request.body.callSid || 
+                  request.body.call_sid ||
+                  request.query.CallSid;
+                  
+    if (!callId) {
+        console.error('❌ No CallSid found in request');
+        throw new Error('No CallSid provided in request');
+    }
+
+    // Check if we can accept the call
+    if (!callTracker.canAcceptInbound()) {
+        console.log('⚠️ Cannot accept inbound call - system at capacity');
+        const twiml = new twilio.twiml.VoiceResponse();
+        twiml.say('We are currently experiencing high call volume. Please try your call again later.');
+        twiml.hangup();
+        reply.header('Content-Type', 'text/xml');
+        return twiml.toString();
+    }
+
+    let conn;
+    try {
+        const inboundNumber = request.body.To.replace(/[^+\d]/g, '');
+        console.log('🔍 Normalized inbound number:', inboundNumber);
+        
+        // Track the inbound call
+        callTracker.addInbound(callId);
+        
+        conn = await getConnection();
+        
+        // Get call configuration
+        const { config, availableTransfers } = await getCallConfig(conn, inboundNumber, {
+            channel_type: 'inbound',
+            is_outbound: false
+        });
+
+        if (!config) {
+            console.log('❌ No training data found for number:', inboundNumber);
+            const twiml = new twilio.twiml.VoiceResponse();
+            twiml.say('We are currently experiencing technical difficulties. Please try your call again later.');
+            twiml.hangup();
+            reply.header('Content-Type', 'text/xml');
+            return twiml.toString();
+        }
+
+        // Create conversation record
+        const conversationId = uuidv4();
+        await conn.query(
+            `INSERT INTO conversations 
+             (id, agent_id, user_number, contact_info, channel_type, status, start_time, metadata) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                conversationId,
+                config.id,
+                request.body.From,
+                request.body.From,
+                'inbound',
+                'initiated',
+                new Date(),
+                JSON.stringify({
+                    ultravox_id: null, // Will be updated after Ultravox call
+                    twilio_sid: callId,
+                    recording_enabled: true,
+                    summary: true,
+                    short_summary: true,
+                    end_reason: null,
+                    error_count: 0
+                })
+            ]
+        );
+
+        // Debug log the transfer rules
+        console.log('🔄 Transfer Rules Debug:', {
+            raw: config.transfer_rules,
+            parsed: typeof config.transfer_rules === 'string' ? 
+                JSON.parse(config.transfer_rules) : 
+                config.transfer_rules
+        });
+
+        // Get the transfer numbers from available transfers
+        const transferNumbers = availableTransfers.map(t => t.number);
+        console.log('📞 Available Transfer Numbers:', transferNumbers);
+
+        // Get tools for this agent
+        const agentTools = await getAgentTools(conn, config.id);
+        
+        // Format tools for Ultravox
+        const formattedTools = formatToolsForUltravox(agentTools, callId, inboundNumber);
+
+        const selectedTools = [
+            { "toolName": "hangUp" },
+            // Include the transfer tool if transfer_rules exist
+            ...(config.transfer_rules ? [{
+                "temporaryTool": {
+                    "modelToolName": "transfer",
+                    "description": "Transfer the call to another person",
+                    "dynamicParameters": [
+                        {
+                            "name": "callSid",
+                            "location": "PARAMETER_LOCATION_BODY",
+                            "schema": {
+                                "type": "string",
+                                "description": "The current call SID",
+                                "enum": [callId]
+                            },
+                            "required": true
+                        },
+                        {
+                            "name": "transferNumber",
+                            "location": "PARAMETER_LOCATION_BODY",
+                            "schema": {
+                                "type": "string",
+                                "description": "The phone number to transfer to",
+                                "enum": availableTransfers.map(t => t.number)
+                            },
+                            "required": true
+                        },
+                        {
+                            "name": "fromNumber",
+                            "location": "PARAMETER_LOCATION_BODY",
+                            "schema": {
+                                "type": "string",
+                                "description": "The number to transfer from",
+                                "enum": [inboundNumber.replace(/^\+?1?/, '').replace(/\D/g, '')]
+                            },
+                            "required": true
+                        }
+                    ],
+                    "http": {
+                        "baseUrlPattern": `${process.env.BASE_URL}/transfer-handler/transfer`,
+                        "httpMethod": "POST"
+                    }
+                }
+            }] : []),
+            ...formattedTools
+        ];
+        
+        // Initialize call in Ultravox
+        const response = await fetch('https://api.ultravox.ai/api/calls', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': process.env.ULTRAVOX_API_KEY
+            },
+            body: JSON.stringify({
+                systemPrompt: createInboundPrompt(config, availableTransfers),
+                model: 'fixie-ai/ultravox',
+                voice: config.voice || 'echo',
+                temperature: 0.3,
+                medium: { "twilio": {} },
+                recordingEnabled: true,
+                selectedTools: selectedTools
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to create Ultravox call: ${await response.text()}`);
+        }
+
+        const ultravoxResponse = await response.json();
+
+        // Update conversation with Ultravox ID
+        await conn.query(
+            `UPDATE conversations 
+             SET metadata = JSON_SET(metadata, '$.ultravox_id', ?) 
+             WHERE id = ?`,
+            [ultravoxResponse.callId, conversationId]
+        );
+
+        // Generate TwiML
+        const twiml = new twilio.twiml.VoiceResponse();
+        const connect = twiml.connect();
+        const stream = connect.stream({
+            url: ultravoxResponse.joinUrl,
+            name: 'ultravox'
+        });
+
+        stream.parameter('CallSid', callId);
+        stream.parameter('call_sid', callId);
+        stream.parameter('from', request.body.From);
+        stream.parameter('to', request.body.To);
+
+        // Start monitoring
+        monitorUltravoxCall(ultravoxResponse.callId);
+
+        reply.header('Content-Type', 'text/xml');
+        return twiml.toString();
+
+    } catch (error) {
+        console.error('❌ Error handling call:', error);
+        // Remove call from tracker in case of error
+        callTracker.removeCall(callId, false);
+        const twiml = new twilio.twiml.VoiceResponse();
+        twiml.say('Sorry, we are unable to connect your call at this time. Please try again later.');
+        twiml.hangup();
+        reply.header('Content-Type', 'text/xml');
+        return twiml.toString();
+    } finally {
+        if (conn) await conn.release();
+    }
+}
+
+// Define status handler
+async function handleIncomingStatus(request, reply) {
+    console.log('📞 Status Update:', request.body);
+    return { status: 'received' };
+}
+
+// Define stream handler
+async function handleIncomingStream(request, reply) {
+    console.log('📞 Stream Event:', request.body);
+    return { status: 'received' };
+}
+
+// Register routes for all variations
+fastify.post('/inbound-handler/incoming', handleIncomingCall);
+fastify.post('/inbound-handler/status', handleIncomingStatus);
+fastify.post('/inbound-handler/stream', handleIncomingStream);
+fastify.post('/incoming', handleIncomingCall);
+fastify.post('/status', handleIncomingStatus);
+fastify.post('/stream', handleIncomingStream);
+fastify.post('//incoming', handleIncomingCall);
+fastify.post('//status', handleIncomingStatus);
+fastify.post('//stream', handleIncomingStream);
+
+// Plugins
+fastify.register(fastifyFormBody);
+
+// After the fastify initialization, add WebSocket support
+fastify.register(fastifyWebsocket, {
+    options: {
+        maxPayload: 1048576,
+        clientTracking: true
+    }
+});
+
+// Database connection config
+const dbConfig = {
+    host: 'localhost',
+    user: 'voice',
+    password: 'Silverbook224!',
+    database: 'voice',
+    connectTimeout: 30000,
+    connectionLimit: 25,      // Increased for more concurrent connections
+    acquireTimeout: 30000,    // Time to wait for a connection from pool
+    idleTimeout: 60000,       // How long a connection can be idle before being released
+    queueLimit: 0,           // Unlimited queue (default is 0)
+    multipleStatements: true  // Allow multiple statements per query
+};
+
+// Create a connection pool
+const pool = mariadb.createPool(dbConfig);
+
+// Track pool usage
+let activeConnections = 0;
+let totalConnections = 0;
+
+// Wrap getConnection to track usage
+const getConnection = async () => {
+    try {
+        const conn = await pool.getConnection();
+        activeConnections++;
+        totalConnections = Math.max(totalConnections, activeConnections);
+        
+        // Wrap the release method to track connection release
+        const originalRelease = conn.release;
+        conn.release = () => {
+            activeConnections--;
+            return originalRelease.call(conn);
+        };
+        
+        return conn;
+    } catch (error) {
+        console.error('Failed to get connection:', error);
+        throw error;
+    }
+};
+
+// Add connection pool monitoring
+setInterval(() => {
+    console.log('🏊 Connection Pool Status:', {
+        activeConnections,
+        totalConnectionsSeen: totalConnections,
+        configuredLimit: dbConfig.connectionLimit
+    });
+}, 60000); // Log every minute
+
+// Add cleanup on process exit
+process.on('exit', async () => {
+    try {
+        console.log('Closing database pool...');
+        console.log('Final connection stats:', {
+            activeConnections,
+            totalConnectionsSeen: totalConnections
+        });
+        await pool.end();
+        console.log('Database pool closed');
+    } catch (error) {
+        console.error('Error closing database pool:', error);
+    }
+});
+
+// After the activeCalls declaration
+const activeCallMonitors = new Map();
+
+// Add these constants near the top
+const MAX_POLL_ATTEMPTS = 10;
+const POLL_INTERVAL = 2000; // 2 seconds
+const FINAL_WAIT_TIME = 5000; // 5 seconds after call ends
+
+// Add after the activeCalls declaration
+const MAX_CONCURRENT_CALLS = 20; // Maximum total concurrent calls (inbound + outbound)
+const MAX_CONCURRENT_OUTBOUND = 10; // Maximum concurrent outbound calls
+const MAX_CONCURRENT_INBOUND = 10; // Maximum concurrent inbound calls
+const RATE_LIMIT_WINDOW = 60000; // 1 minute window
+const MAX_CALLS_PER_WINDOW = 30; // Maximum calls per minute
+
+// Add call tracking
+const callTracker = {
+    inboundCount: 0,
+    outboundCount: 0,
+    recentCalls: [], // Track calls for rate limiting
+    
+    canAcceptInbound() {
+        this.cleanupRecentCalls();
+        return this.inboundCount < MAX_CONCURRENT_INBOUND && 
+               (this.inboundCount + this.outboundCount) < MAX_CONCURRENT_CALLS &&
+               this.recentCalls.length < MAX_CALLS_PER_WINDOW;
+    },
+    
+    canAcceptOutbound() {
+        this.cleanupRecentCalls();
+        return this.outboundCount < MAX_CONCURRENT_OUTBOUND && 
+               (this.inboundCount + this.outboundCount) < MAX_CONCURRENT_CALLS &&
+               this.recentCalls.length < MAX_CALLS_PER_WINDOW;
+    },
+    
+    addInbound(callId) {
+        this.inboundCount++;
+        this.recentCalls.push({ timestamp: Date.now(), callId });
+        console.log('📈 Call Stats - Added Inbound:', {
+            inbound: this.inboundCount,
+            outbound: this.outboundCount,
+            total: this.inboundCount + this.outboundCount,
+            recentCalls: this.recentCalls.length
+        });
+    },
+    
+    addOutbound(callId) {
+        this.outboundCount++;
+        this.recentCalls.push({ timestamp: Date.now(), callId });
+        console.log('📈 Call Stats - Added Outbound:', {
+            inbound: this.inboundCount,
+            outbound: this.outboundCount,
+            total: this.inboundCount + this.outboundCount,
+            recentCalls: this.recentCalls.length
+        });
+    },
+    
+    removeCall(callId, isOutbound) {
+        if (isOutbound) {
+            this.outboundCount = Math.max(0, this.outboundCount - 1);
+        } else {
+            this.inboundCount = Math.max(0, this.inboundCount - 1);
+        }
+        this.recentCalls = this.recentCalls.filter(call => call.callId !== callId);
+        console.log('📉 Call Stats - Removed Call:', {
+            inbound: this.inboundCount,
+            outbound: this.outboundCount,
+            total: this.inboundCount + this.outboundCount,
+            recentCalls: this.recentCalls.length
+        });
+    },
+    
+    cleanupRecentCalls() {
+        const cutoff = Date.now() - RATE_LIMIT_WINDOW;
+        this.recentCalls = this.recentCalls.filter(call => call.timestamp > cutoff);
+    }
+};
+
+// Add cleanup on process exit
+process.on('exit', () => {
+    console.log('📊 Final Call Stats:', {
+        inbound: callTracker.inboundCount,
+        outbound: callTracker.outboundCount,
+        total: callTracker.inboundCount + callTracker.outboundCount,
+        recentCalls: callTracker.recentCalls.length
+    });
+});
+
+// Add the monitor function
+async function monitorUltravoxCall(callId) {
+    console.log(`[${callId}] Starting call monitor`);
+    
+    let isActive = true;
+    let startTime = Date.now();
+    let endedTime = null;
+
+    const monitor = async () => {
+        if (!isActive) {
+            console.log(`[${callId}] Monitor stopped`);
+            return;
+        }
+
+        let conn;
+        try {
+            console.log(`[${callId}] Checking call status...`);
+            const response = await fetch(`https://api.ultravox.ai/api/calls/${callId}`, {
+                headers: {
+                    'X-API-Key': process.env.ULTRAVOX_API_KEY
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to get call data: ${response.statusText}`);
+            }
+
+            const callData = await response.json();
+            
+            if (callData.ended) {
+                if (!endedTime) {
+                    endedTime = Date.now();
+                }
+                
+                try {
+                    console.log(`[${callId}] Processing ended call...`);
+                    conn = await getConnection();
+                    
+                    // Get recording if available
+                    let recordingUrl = null;
+                    if (callData.recordingEnabled) {
+                        console.log(`[${callId}] Fetching recording...`);
+                        const recordingResponse = await fetch(`https://api.ultravox.ai/api/calls/${callId}/recording`, {
+                            headers: { 'X-API-Key': process.env.ULTRAVOX_API_KEY }
+                        });
+                        
+                        console.log(`[${callId}] Recording API response:`, recordingResponse.status);
+                        
+                        if (recordingResponse.ok) {
+                            const recordingsDir = '/var/www/vhosts/smartfollowup.ai/httpdocs/recordings';
+                            if (!fs.existsSync(recordingsDir)) {
+                                fs.mkdirSync(recordingsDir, { recursive: true });
+                            }
+
+                            const [conversation] = await conn.query(
+                                `SELECT id FROM conversations WHERE metadata LIKE ?`,
+                                [`%${callId}%`]
+                            );
+
+                            if (conversation) {
+                                const fileName = `${conversation.id}.wav`;
+                                const filePath = `${recordingsDir}/${fileName}`;
+                                const arrayBuffer = await recordingResponse.arrayBuffer();
+                                fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
+                                recordingUrl = `${BASE_URL}/recordings/${fileName}`;
+                                console.log(`[${callId}] Saved recording to ${recordingUrl}`);
+                            }
+                        }
+                    }
+
+                    // Update conversation record
+                    console.log(`[${callId}] Updating conversation record...`);
+                    const updateResult = await conn.query(
+                        `UPDATE conversations 
+                         SET status = ?,
+                             end_time = ?,
+                             recording_url = ?,
+                             transcript = ?,
+                             metadata = JSON_SET(
+                                COALESCE(metadata, '{}'),
+                                '$.summary', ?,
+                                '$.short_summary', ?,
+                                '$.end_reason', ?,
+                                '$.error_count', ?
+                             )
+                         WHERE metadata LIKE ?`,
+                        [
+                            'completed',
+                            new Date(callData.ended),
+                            recordingUrl,
+                            callData.summary || null,
+                            callData.summary,
+                            callData.shortSummary,
+                            callData.endReason,
+                            callData.errorCount || 0,
+                            `%${callId}%`
+                        ]
+                    );
+                    console.log(`[${callId}] Update result:`, updateResult);
+
+                    isActive = false;
+                    activeCallMonitors.delete(callId);
+                    console.log(`[${callId}] Call processing completed`);
+                    return;
+                } finally {
+                    if (conn) {
+                        await conn.end();
+                        conn = null;
+                    }
+                }
+            }
+
+            // Fix: Use proper setTimeout for promises
+            if (isActive) {
+                await setTimeout(5000);  // Just pass the number of milliseconds
+                monitor();  // Call monitor after the delay
+            }
+
+        } catch (error) {
+            console.error(`[${callId}] Error monitoring call:`, error);
+            if (isActive) {
+                await setTimeout(5000);  // Fix here too
+                monitor();
+            }
+        } finally {
+            if (conn) {
+                await conn.end();
+                conn = null;
+            }
+        }
+    };
+
+    // Start the monitor
+    monitor();
+    
+    // Store the monitor reference
+    activeCallMonitors.set(callId, { 
+        stop: () => { 
+            isActive = false;
+            console.log(`[${callId}] Monitor stop requested`);
+        } 
+    });
+}
+
+// Add more detailed request logging
+fastify.addHook('onRequest', async (request, reply) => {
+    console.log('🔍 Raw request:', {
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body: request.body,
+        query: request.query,
+        raw: request.raw,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Add response logging
+fastify.addHook('onResponse', async (request, reply) => {
+    console.log('📤 Outgoing response:', {
+        method: request.method,
+        url: request.url,
+        statusCode: reply.statusCode,
+        duration: reply.elapsedTime || 0,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Add error logging for unhandled promises
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🚨 Unhandled Rejection:', {
+        reason,
+        stack: reason.stack,
+        promise
+    });
+});
+
+// Add error logging for uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('🚨 Uncaught Exception:', {
+        error,
+        stack: error.stack
+    });
+});
+
+// Add error logging
+fastify.setErrorHandler(function (error, request, reply) {
+    console.error('❌ Fastify error:', {
+        error: error.message,
+        stack: error.stack,
+        url: request.url,
+        method: request.method,
+        headers: request.headers,
+        timestamp: new Date().toISOString()
+    });
+    reply.status(500).send({ error: error.message });
+});
+
+// Add 404 handler
+fastify.setNotFoundHandler(function (request, reply) {
+    console.log('⚠️ Route not found:', {
+        url: request.url,
+        method: request.method,
+        headers: request.headers,
+        timestamp: new Date().toISOString()
+    });
+    reply.status(404).send({ error: 'Route not found' });
+});
+
+// Add cleanup for WebSocket connections
+const activeWebSockets = new Set();
+
+fastify.register(async function (instance) {
+    instance.get('/stream', { websocket: true }, (connection, req) => {
+        // Add to active connections
+        activeWebSockets.add(connection.socket);
+
+        // Clean up on close
+        connection.socket.on('close', () => {
+            activeWebSockets.delete(connection.socket);
+            console.log(`🔌 WebSocket closed and cleaned up: ${connection.socket}`);
+        });
+
+        // Force close after timeout (5 minutes)
+        setTimeout(() => {
+            if (connection.socket.readyState === WebSocket.OPEN) {
+                connection.socket.close();
+                activeWebSockets.delete(connection.socket);
+                console.log('🔌 Force closed stale WebSocket connection');
+            }
+        }, 300000);
+    });
+});
+
+// Add cleanup on process exit
+process.on('SIGTERM', () => {
+    console.log('Process terminating...');
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('Process interrupted...');
+    process.exit(0);
+});
+
+// Outside the route handler - define the prompt templates
+const createInboundPrompt = (config, availableTransfers) => {
+    // Format transfer rules for the prompt
+    let transferRulesText = '';
+    if (availableTransfers && availableTransfers.length > 0) {
+        transferRulesText = '\nTransfer Rules:\n';
+        availableTransfers.forEach(rule => {
+            transferRulesText += `- Transfer to ${rule.name || rule.number}\n`;
+            if (rule.trigger_phrases && rule.trigger_phrases.length > 0) {
+                const phrases = rule.trigger_phrases.join('", "');
+                transferRulesText += `  When caller mentions: "${phrases}"\n`;
+            }
+        });
+    }
+
+    return `
+You are an agent named ${config.name}.  
+You work for ${config.company}.  
+You are answering incoming calls from users.
+
+Your main instructions are:
+${config.agent_instructions || ''}
+
+Base Rules:
+- Greet the caller politely. After greeting, pause and tell them: "This call may be recorded for training and quality purposes."
+- Speak naturally at about 70 words per minute.
+- DO NOT use actions, stage directions, or sound effects.
+- ONLY ask one question at a time.
+- For general inquiries, you must collect the user's name, email, and phone number.
+- IMPORTANT: If someone asks to be transferred, do it immediately without collecting any information.
+- When a transfer is requested, simply acknowledge and use the transfer tool right away.
+- Spell all names and email addresses 100% accurately. Spell them slowly, clearly, and pause between each letter if needed.
+- When speaking phone numbers:
+    - Say each digit separately, with a slight pause.
+    - Never say "double" or "triple" for repeated digits.
+    - Format numbers like: "1... 2... 3... 4... 5... 6... 7... 8... 9... 0"
+- Say years naturally like "nineteen ninety-nine" or "twenty twenty-four."
+- Codes must be spoken as individual digits.
+
+Transfer Priority:
+- If a caller mentions any trigger phrase or asks for a transfer, handle that IMMEDIATELY.
+- Do not ask for any information before transferring.
+- Simply acknowledge their request and execute the transfer.
+- Example: If someone says "transfer me to Tabbatha", just say "I'll transfer you to Tabbatha now" and use the transfer tool.
+
+Business Hours Policy:
+The business hours for ${config.company} are:
+${config.business_hours || 'Not specified'}
+- NEVER schedule anything outside of these hours.
+- If a caller asks to schedule outside of business hours, politely decline and offer available times within business hours.
+
+${transferRulesText}
+
+Available Tools:
+1. hangUp — Use to end the call politely after the conversation is finished.
+${availableTransfers.length > 0 ? '2. transfer — Use to connect the caller to another person based on the transfer rules above.' : ''}
+
+Important:
+- Take a short pause between sentences. Breathe naturally.
+- If the user is finished, say a friendly goodbye and then use the 'hangUp' tool to end the call.
+${availableTransfers.length > 0 ? `- When transferring a call:
+    1. Tell the caller you will transfer them
+    2. Use the transfer tool with the appropriate number based on the rules above
+    3. Wait for confirmation before ending the conversation` : ''}
+
+Stay professional, friendly, accurate, and patient at all times.`;
+};
+
+const createOutboundPrompt = (config) => {
+    // Format transfer rules for the prompt
+    let transferRulesText = '';
+    let hasTransferRules = false;
+    if (config.transfer_rules && Array.isArray(config.transfer_rules)) {
+        const validRules = config.transfer_rules.filter(rule => rule.condition === 'business_hours');
+        if (validRules.length > 0) {
+            hasTransferRules = true;
+            transferRulesText = '\nTransfer Rules:\n';
+            validRules.forEach(rule => {
+                transferRulesText += `- During business hours, transfer to ${rule.number}\n`;
+                if (rule.trigger_phrases && rule.trigger_phrases.length > 0) {
+                    const phrases = rule.trigger_phrases.join('", "');
+                    transferRulesText += `  When caller mentions: "${phrases}"\n`;
+                }
+            });
+        }
+    }
+
+    return `
+You are an outbound agent named ${config.name}.  
+You work for ${config.company}.  
+You are making outgoing calls to users.
+
+Your main instructions are:
+${config.agent_instructions || ''}
+
+Base Rules:
+- Greet the person politely when they answer. After greeting, pause and tell them: "This call may be recorded for training and quality purposes."
+- Speak naturally at about 70 words per minute.
+- DO NOT use actions, stage directions, or sound effects.
+- ONLY ask one question at a time.
+- For general conversations, you must collect the user's name, email, and phone number if needed.
+- IMPORTANT: If someone asks to be transferred, do it immediately without collecting any information.
+- When a transfer is requested, simply acknowledge and use the transfer tool right away.
+- Spell all names and email addresses 100% accurately. Spell them slowly, clearly, and pause between each letter if needed.
+- When speaking phone numbers:
+    - Say each digit separately, with a slight pause.
+    - Never say "double" or "triple" for repeated digits.
+    - Format numbers like: "1... 2... 3... 4... 5... 6... 7... 8... 9... 0"
+- Say years naturally like "nineteen ninety-nine" or "twenty twenty-four."
+- Codes must be spoken as individual digits.
+
+Transfer Priority:
+- If a caller mentions any trigger phrase or asks for a transfer, handle that IMMEDIATELY.
+- Do not ask for any information before transferring.
+- Simply acknowledge their request and execute the transfer.
+- Example: If someone says "transfer me to Tabbatha", just say "I'll transfer you to Tabbatha now" and use the transfer tool.
+
+Business Hours Policy:
+The business hours for ${config.company} are:
+${config.business_hours || 'Not specified'}
+- NEVER schedule anything outside of these hours.
+- If a user wants to schedule outside of business hours, politely decline and offer times within business hours.
+
+${transferRulesText}
+
+Available Tools:
+1. hangUp — Use to end the call politely after the conversation is finished.
+${hasTransferRules ? '2. transfer — Use to connect the caller to another person based on the transfer rules above.' : ''}
+
+Important:
+- Take a short pause between sentences. Breathe naturally.
+- If the user is finished, say a friendly goodbye and then use the 'hangUp' tool to end the call.
+${hasTransferRules ? `- When transferring a call:
+    1. Tell the caller you will transfer them
+    2. Use the transfer tool with the appropriate number based on the rules above
+    3. Wait for confirmation before ending the conversation` : ''}
+
+Stay professional, friendly, accurate, and patient at all times.`;
+};
+
+// Function to determine if a call is outbound based on metadata
+function isOutboundCall(metadata) {
+    try {
+        const parsedMetadata = typeof metadata === 'string' ? JSON.parse(metadata) : metadata;
+        return parsedMetadata?.channel_type === 'outbound' || parsedMetadata?.is_outbound === true;
+    } catch (error) {
+        console.error('Error parsing metadata:', error);
+        return false;
+    }
+}
+
+// Modify the config query to handle both inbound and outbound
+async function getCallConfig(conn, inboundNumber, metadata = null) {
+    console.log('🔍 Getting call configuration:', { inboundNumber, metadata });
+    
+    try {
+        const isOutbound = isOutboundCall(metadata);
+        console.log(`Call type: ${isOutbound ? 'Outbound' : 'Inbound'}`);
+
+        // Get the configuration from ai_agents and inbound_agent_config
+        const configQuery = `
+            SELECT 
+                a.id,
+                a.name,
+                a.company,
+                a.voice,
+                a.base_prompt as agent_instructions,
+                c.business_hours,
+                c.inbound_number,
+                c.description,
+                CASE 
+                    WHEN c.transfer_rules IS NOT NULL THEN
+                        REPLACE(
+                            REPLACE(
+                                REPLACE(c.transfer_rules, '+1', ''
+                            ), '"number": "1', '"number": "'
+                        ), '+', ''
+                    )
+                    ELSE NULL
+                END as transfer_rules
+            FROM ai_agents a
+            JOIN inbound_agent_config c ON a.id = c.agent_id
+            WHERE c.inbound_number = ?`;
+            
+        const [config] = await conn.query(configQuery, [inboundNumber]);
+
+        if (!config) {
+            console.log('❌ No configuration found for number:', inboundNumber);
+            return null;
+        }
+
+        // Parse transfer rules and validate against business hours
+        let availableTransfers = [];
+        if (config.transfer_rules) {
+            console.log('🔄 Processing transfer rules:', config.transfer_rules);
+            
+            let rules = typeof config.transfer_rules === 'string' ? 
+                JSON.parse(config.transfer_rules) : 
+                config.transfer_rules;
+
+            // Double check the numbers are clean
+            rules = rules.map(rule => ({
+                ...rule,
+                number: rule.number.replace(/^\+?1?/, '').replace(/\D/g, '')
+            }));
+                
+            console.log('📋 Parsed and cleaned rules:', rules);
+
+            // Get current time in America/Chicago timezone
+            const now = new Date();
+            // Adjust for Central Time (UTC-5 or UTC-6)
+            const centralTime = new Date(now.getTime() - (5 * 60 * 60 * 1000)); // Simplified to UTC-5 for now
+            const currentDay = centralTime.getDay();
+            const currentHour = centralTime.getHours();
+            const currentMinute = centralTime.getMinutes();
+            
+            console.log('⏰ Current Central time:', {
+                day: currentDay,
+                hour: currentHour,
+                minute: currentMinute,
+                fullDate: centralTime.toISOString()
+            });
+
+            // Parse business hours
+            const businessHours = config.business_hours ? 
+                (typeof config.business_hours === 'string' ? 
+                    JSON.parse(config.business_hours) : 
+                    config.business_hours) : 
+                null;
+                
+            console.log('⏰ Business hours:', businessHours);
+
+            if (Array.isArray(rules)) {
+                // Define days array for business hours lookup
+                const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+                
+                rules.forEach(rule => {
+                    let isAvailable = true;
+                    console.log('🔍 Processing rule:', rule);
+
+                    // Don't allow transfer to the number we're calling from
+                    if (rule.number === inboundNumber.replace(/^\+?1?/, '').replace(/\D/g, '')) {
+                        console.log('❌ Skipping self-transfer number:', rule.number);
+                        return;
+                    }
+
+                    // Check business hours condition if rule requires it
+                    if (rule.condition === 'business_hours' && businessHours) {
+                        const todayHours = businessHours[days[currentDay]];
+                        console.log('⏰ Today\'s hours:', todayHours);
+                        
+                        if (todayHours) {
+                            const [startHour, startMinute] = todayHours.start.split(':').map(Number);
+                            const [endHour, endMinute] = todayHours.end.split(':').map(Number);
+                            
+                            const currentTime = currentHour * 60 + currentMinute;
+                            const startTime = startHour * 60 + startMinute;
+                            const endTime = endHour * 60 + endMinute;
+
+                            isAvailable = currentTime >= startTime && currentTime <= endTime;
+                            console.log('⏰ Time check:', {
+                                currentTime,
+                                startTime,
+                                endTime,
+                                isAvailable
+                            });
+                        } else {
+                            isAvailable = false;
+                            console.log('⏰ No hours defined for today');
+                        }
+                    }
+
+                    if (isAvailable) {
+                        availableTransfers.push({
+                            number: rule.number,
+                            name: rule.name || '',
+                            trigger_phrases: rule.trigger_phrases || []
+                        });
+                        console.log('✅ Added transfer option:', {
+                            number: rule.number,
+                            name: rule.name || '',
+                            trigger_phrases: rule.trigger_phrases || []
+                        });
+                    } else {
+                        console.log('❌ Transfer not available:', {
+                            number: rule.number,
+                            name: rule.name || '',
+                            reason: rule.condition === 'business_hours' ? 'Outside business hours' : 'Unknown'
+                        });
+                    }
+                });
+            }
+        }
+
+        // Get the transfer numbers from available transfers
+        const transferNumbers = availableTransfers.map(t => t.number);
+        console.log('📞 Available Transfer Numbers:', transferNumbers);
+
+        console.log('📋 Retrieved configuration:', {
+            name: config.name,
+            company: config.company,
+            voice: config.voice,
+            isOutbound,
+            hasAgentInstructions: !!config.agent_instructions,
+            hasBusinessHours: !!config.business_hours,
+            availableTransfers
+        });
+
+        // Create the system prompt
+        const systemPrompt = isOutbound ? createOutboundPrompt(config) : createInboundPrompt(config, availableTransfers);
+
+        return {
+            config,
+            availableTransfers
+        };
+
+    } catch (error) {
+        console.error('Error getting call configuration:', error);
+        throw error;
+    }
+}
+
+// Add after database connection config
+async function lookupCallerInfo(conn, inboundNumber, callerNumber) {
+    console.log('🔍 Looking up caller info:', { inboundNumber, callerNumber });
+    
+    try {
+        // First get the owner_id from inbound_agent_config
+        const [config] = await conn.query(
+            `SELECT owner_id 
+             FROM inbound_agent_config 
+             WHERE inbound_number = ?`,
+            [inboundNumber]
+        );
+
+        if (!config) {
+            console.log('❌ No config found for inbound number:', inboundNumber);
+            return null;
+        }
+
+        // Format phone number - remove +1 or 1 prefix and any non-digits
+        let formattedNumber = callerNumber.replace(/[^0-9]/g, '');
+        if (formattedNumber.length === 11 && formattedNumber.startsWith('1')) {
+            formattedNumber = formattedNumber.substring(1);
+        }
+        
+        console.log('📱 Formatted phone number for lookup:', formattedNumber);
+
+        // Then lookup the contact in the user's contacts
+        const [contact] = await conn.query(
+            `SELECT 
+                first_name,
+                last_name,
+                address,
+                city,
+                state,
+                zip,
+                phone,
+                email
+             FROM contacts 
+             WHERE owner_id = ? 
+             AND phone = ?`,
+            [config.owner_id, formattedNumber]
+        );
+
+        if (contact) {
+            console.log('✅ Found contact:', contact);
+            return contact;
+        }
+
+        console.log('❌ No contact found for number:', formattedNumber);
+        return null;
+    } catch (error) {
+        console.error('❌ Error looking up caller info:', error);
+        return null;
+    }
+}
+
+// Add after the getConnection function
+async function getAgentTools(conn, agentId) {
+    try {
+        // Get all tools assigned to this agent
+        const tools = await conn.query(
+            `SELECT t.*, at.configuration 
+             FROM ultravox_tools t
+             JOIN agent_tools at ON t.tool_id = at.tool_id
+             WHERE at.agent_id = ? AND at.is_active = 1 AND t.status = 'active'`,
+            [agentId]
+        );
+        
+        console.log(`Found ${tools.length} tools for agent ${agentId}`);
+        return tools;
+    } catch (error) {
+        console.error('Error fetching agent tools:', error);
+        return [];
+    }
+}
+
+// Add a function to format tools for Ultravox
+function formatToolsForUltravox(tools, callId, inboundNumber) {
+    return tools.map(tool => {
+        try {
+            // Skip weather tool
+            if (tool.tool_id === 'weather') {
+                console.log('⚠️ Skipping weather tool for compatibility');
+                return null;
+            }
+
+            // Handle tool definition parsing
+            let toolDef = tool.definition;
+            if (typeof toolDef === 'string') {
+                toolDef = JSON.parse(toolDef);
+            } else if (typeof toolDef === 'object') {
+                toolDef = toolDef;
+            } else {
+                console.error('Invalid tool definition format:', toolDef);
+                return null;
+            }
+
+            // Handle configuration parsing
+            let config = {};
+            if (tool.configuration) {
+                try {
+                    config = typeof tool.configuration === 'string' ? 
+                        JSON.parse(tool.configuration) : 
+                        tool.configuration;
+                } catch (e) {
+                    console.error('Error parsing tool configuration:', e);
+                }
+            }
+
+            // If it's a standard tool (like hangUp), return it directly
+            if (toolDef.type === 'standard') {
+                return { "toolName": tool.tool_id };
+            }
+
+            // For custom tools, create a temporaryTool object
+            const tempTool = {
+                "modelToolName": tool.tool_id,
+                "dynamicParameters": []
+            };
+
+            // Add parameters from the tool definition
+            if (toolDef.parameters) {
+                tempTool.dynamicParameters = toolDef.parameters.map(param => ({
+                    name: param.name,
+                    location: param.location || "PARAMETER_LOCATION_BODY",
+                    schema: {
+                        type: param.schema.type,
+                        description: param.schema.description,
+                        enum: param.schema.enum
+                    },
+                    required: param.required || false
+                }));
+
+                // Replace special variables in enum values
+                tempTool.dynamicParameters.forEach(param => {
+                    if (param.schema && param.schema.enum) {
+                        if (param.name === 'callSid') {
+                            param.schema.enum = [callId];
+                        } else if (param.name === 'fromNumber') {
+                            param.schema.enum = [inboundNumber];
+                        }
+                    }
+                });
+            }
+
+            // Add HTTP configuration
+            if (toolDef.http) {
+                tempTool.http = {
+                    "baseUrlPattern": `${process.env.BASE_URL}/transfer-handler/transfer`,
+                    "httpMethod": toolDef.http.httpMethod
+                };
+            }
+
+            return { "temporaryTool": tempTool };
+        } catch (error) {
+            console.error('Error formatting tool:', tool.tool_id, error);
+            return null;
+        }
+    }).filter(Boolean); // Remove any null entries from failed parsing
+}
+
+const toolHandlers = {
+    // Standard tool handlers
+    hangUp: async (params, conn, client, callSid) => {
+        console.log(`🔄 Processing hangUp tool for call: ${callSid}`);
+        
+        // End the call using Twilio
+        await client.calls(callSid).update({ status: 'completed' });
+        
+        return { success: true, message: 'Call ended successfully' };
+    },
+    
+    // Custom tool handlers
+    weather: async (params, conn, client, callSid) => {
+        console.log(`🌤️ Processing weather tool for location: ${params.location}`);
+        
+        // Call the weather API directly
+        const weatherApiKey = process.env.WEATHER_API_KEY || 'YOUR_WEATHER_API_KEY';
+        const weatherUrl = `https://api.weatherapi.com/v1/current.json?key=${weatherApiKey}&q=${encodeURIComponent(params.location)}`;
+        
+        try {
+            const weatherResponse = await fetch(weatherUrl);
+            const weatherData = await weatherResponse.json();
+            
+            if (weatherData.error) {
+                console.error(`❌ Weather API error: ${weatherData.error.message}`);
+                return { error: weatherData.error.message };
+            }
+            
+            // Format the response for the AI agent
+            return {
+                success: true,
+                location: `${weatherData.location.name}, ${weatherData.location.region}, ${weatherData.location.country}`,
+                temperature: `${weatherData.current.temp_c}°C (${weatherData.current.temp_f}°F)`,
+                condition: weatherData.current.condition.text,
+                humidity: `${weatherData.current.humidity}%`,
+                wind: `${weatherData.current.wind_kph} km/h from ${weatherData.current.wind_dir}`,
+                precipitation: `${weatherData.current.precip_mm} mm`,
+                feels_like: `${weatherData.current.feelslike_c}°C (${weatherData.current.feelslike_f}°F)`,
+                last_updated: weatherData.current.last_updated
+            };
+        } catch (error) {
+            console.error(`❌ Error fetching weather data: ${error.message}`);
+            return { error: 'Failed to fetch weather data' };
+        }
+    },
+    
+    // Generic custom tool handler
+    custom: async (params, conn, client, callSid, toolDef, conversation) => {
+        console.log(`🔧 Processing custom tool: ${params.toolId} for call: ${callSid}`);
+        
+        // Get the custom handler URL from the tool definition
+        const handlerUrl = toolDef.handlerUrl;
+        
+        if (!handlerUrl) {
+            console.error(`❌ Handler URL not defined for tool: ${params.toolId}`);
+            return { error: 'Handler URL not defined' };
+        }
+        
+        // Call the custom handler
+        const customResponse = await fetch(handlerUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                callSid,
+                fromNumber: params.fromNumber,
+                ...params,
+                conversationId: conversation.id,
+                agentId: conversation.agent_id
+            })
+        });
+        
+        if (!customResponse.ok) {
+            const errorText = await customResponse.text();
+            console.error(`❌ Custom tool handler failed: ${errorText}`);
+            return { error: 'Custom tool handler failed' };
+        }
+        
+        return await customResponse.json();
+    }
+};
+
+// Start server
+const port = process.env.INBOUND_HANDLER_PORT || 5054;
+fastify.listen({ port, host: '0.0.0.0' }, (err) => {
+    if (err) {
+        console.error('Error starting server:', err);
+        process.exit(1);
+    }
+    console.log(`Test handler listening on port ${port}`);
+});
+
+// Add this function to handle call completion
+async function handleCallCompletion(callId, ultravoxId) {
+    try {
+        console.log('🔄 Starting call completion handling:', { callId, ultravoxId });
+        
+        // Wait a few seconds to ensure Ultravox has processed everything
+        await setTimeout(FINAL_WAIT_TIME);
+        
+        // Poll for call data
+        let attempts = 0;
+        let callData = null;
+        
+        while (attempts < MAX_POLL_ATTEMPTS) {
+            try {
+                const response = await fetch(`https://api.ultravox.ai/api/calls/${ultravoxId}`, {
+                    headers: {
+                        'X-API-Key': process.env.ULTRAVOX_API_KEY
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`API returned ${response.status}`);
+                }
+                
+                callData = await response.json();
+                console.log('🎯 Call data received:', {
+                    callId,
+                    ultravoxId,
+                    hasTranscript: !!callData.transcript,
+                    hasSummary: !!callData.summary,
+                    hasShortSummary: !!callData.shortSummary,
+                    ended: !!callData.ended
+                });
+                
+                // Check if we have all the data we need and the call has ended
+                if (callData.ended && callData.transcript) {
+                    break;
+                }
+                
+                console.log(`📝 Waiting for complete data (attempt ${attempts + 1}/${MAX_POLL_ATTEMPTS})`);
+                await setTimeout(POLL_INTERVAL);
+                attempts++;
+                
+            } catch (error) {
+                console.error('❌ Error polling call data:', error);
+                await setTimeout(POLL_INTERVAL);
+                attempts++;
+            }
+        }
+        
+        if (!callData) {
+            throw new Error(`Failed to retrieve call data after ${MAX_POLL_ATTEMPTS} attempts`);
+        }
+        
+        // Update database with call data
+        const conn = await getConnection();
+        try {
+            // Get recording if available
+            let recordingUrl = null;
+            if (callData.recordingEnabled) {
+                console.log(`[${ultravoxId}] Fetching recording...`);
+                const recordingResponse = await fetch(`https://api.ultravox.ai/api/calls/${ultravoxId}/recording`, {
+                    headers: { 'X-API-Key': process.env.ULTRAVOX_API_KEY }
+                });
+                
+                if (recordingResponse.ok) {
+                    const recordingsDir = '/var/www/vhosts/smartfollowup.ai/httpdocs/recordings';
+                    if (!fs.existsSync(recordingsDir)) {
+                        fs.mkdirSync(recordingsDir, { recursive: true });
+                    }
+
+                    const [conversation] = await conn.query(
+                        `SELECT id FROM conversations WHERE metadata LIKE ?`,
+                        [`%${callId}%`]
+                    );
+
+                    if (conversation) {
+                        const fileName = `${conversation.id}.wav`;
+                        const filePath = `${recordingsDir}/${fileName}`;
+                        const arrayBuffer = await recordingResponse.arrayBuffer();
+                        fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
+                        recordingUrl = `${process.env.BASE_URL}/recordings/${fileName}`;
+                        console.log(`[${ultravoxId}] Saved recording to ${recordingUrl}`);
+                    }
+                }
+            }
+
+            // Update conversation record
+            console.log(`[${callId}] Updating conversation record...`);
+            const updateResult = await conn.query(
+                `UPDATE conversations 
+                 SET status = ?,
+                     end_time = ?,
+                     recording_url = ?,
+                     transcript = ?,
+                     metadata = JSON_SET(
+                        COALESCE(metadata, '{}'),
+                        '$.summary', ?,
+                        '$.short_summary', ?,
+                        '$.end_reason', ?,
+                        '$.error_count', ?
+                     )
+                 WHERE metadata LIKE ?`,
+                [
+                    'completed',
+                    new Date(callData.ended),
+                    recordingUrl,
+                    JSON.stringify(callData.transcript),
+                    callData.summary,
+                    callData.shortSummary,
+                    callData.endReason,
+                    callData.errorCount || 0,
+                    `%${callId}%`
+                ]
+            );
+            console.log(`[${callId}] Update result:`, updateResult);
+
+            isActive = false;
+            activeCallMonitors.delete(callId);
+            console.log(`[${callId}] Call processing completed`);
+            return;
+        } finally {
+            if (conn) {
+                await conn.end();
+                conn = null;
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error handling call completion:', error);
+        throw error;
+    }
+}
